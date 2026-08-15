@@ -14,7 +14,8 @@ import sys
 import urllib.request
 
 APP_VERSION = "1.0.0"
-UPDATE_URL = "https://example.com/AudioDuck/version.json"   # ← 改成你的更新源地址
+UPDATE_URL = "https://raw.githubusercontent.com/AutumnIsPro/QYAudioDuck/main/version.json"
+# 备选加速源 (如直连 GitHub 慢, 可改用 jsDelivr): https://cdn.jsdelivr.net/gh/AutumnIsPro/QYAudioDuck@main/version.json
 FETCH_TIMEOUT = 10
 
 
