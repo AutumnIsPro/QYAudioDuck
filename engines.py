@@ -16,18 +16,27 @@ def _approach(current, target, step):
     return current + step if target > current else current - step
 
 
-def _find_session(sessions, name):
-    """按进程名查找会话: 先精确匹配, 再子串匹配。"""
+def _find_sessions(sessions, name):
+    """按进程名查找全部匹配会话: 先精确匹配, 再子串匹配。
+
+    一个应用可能拥有多个同名会话 (如网易云音乐常有 2 个), 必须全部处理。
+    """
     if not name:
-        return None
+        return []
     needle = name.strip().lower()
-    for s in sessions:
-        if s.name and s.name.lower() == needle:
-            return s
-    for s in sessions:
-        if s.name and needle in s.name.lower():
-            return s
-    return None
+    exact = [s for s in sessions if s.name and s.name.lower() == needle]
+    if exact:
+        return exact
+    return [s for s in sessions if s.name and needle in s.name.lower()]
+
+
+def _session_keys(music_sessions):
+    """为每个音乐会话生成稳定键 (pid, 同 pid 序号), 用于跨刷新保持原始音量。"""
+    counts = {}
+    for ms in music_sessions:
+        n = counts.get(ms.pid, 0)
+        counts[ms.pid] = n + 1
+        yield (ms.pid, n), ms
 
 
 class MicDuckEngine:
@@ -165,7 +174,7 @@ class MicDuckEngine:
             audio_utils.init_com()
             cur = audio_utils.get_master_volume()
             if cur is not None:
-                audio_utils.set_master_volume(_approach(cur, self.last_base, 0.05))
+                audio_utils.set_master_volume(self.last_base)  # 直接恢复原始音量
 
 
 class AppDuckEngine:
@@ -184,7 +193,7 @@ class AppDuckEngine:
         self.music_volume_now = 1.0   # 音乐应用当前音量
         self.state = "normal"         # normal | ducked | restoring | no_voice | no_music
         self.error = None
-        self.last_base = None         # 闪避前音乐音量(用于停止时恢复)
+        self._bases = {}              # (pid,序号) -> 闪避前原始音量 (用于恢复)
 
         # 配置
         self.voice_app = ""
@@ -228,7 +237,6 @@ class AppDuckEngine:
         cache = []
         last_refresh = 0.0
         silent_since = time.time()
-        base = None
         while True:
             with self._lock:
                 if not self._running:
@@ -241,85 +249,99 @@ class AppDuckEngine:
                 cache = audio_utils.get_sessions()
                 last_refresh = now
 
-            voice_sess = _find_session(cache, voice_app)
-            music_sess = _find_session(cache, music_app)
+            voice_sessions = _find_sessions(cache, voice_app)
+            music_sessions = _find_sessions(cache, music_app)
 
+            # 语音峰值: 取所有语音会话的最大值 (一个应用可能有多个会话)
             peak = 0.0
-            if voice_sess is not None:
+            for vs in voice_sessions:
                 try:
-                    peak = float(voice_sess.meter.GetPeakValue() or 0.0)
+                    peak = max(peak, float(vs.meter.GetPeakValue() or 0.0))
                 except Exception:
-                    peak = 0.0
+                    pass
             self.voice_peak = peak
             active = peak >= threshold
             if active:
                 silent_since = now
 
-            if music_sess is None:
-                base = None
+            if not music_sessions:
+                self._bases.clear()
                 self.state = "no_music"
                 time.sleep(0.1)
                 continue
 
-            try:
-                cur = float(music_sess.volume.GetMasterVolume())
-            except Exception:
-                time.sleep(0.05)
-                continue
-            self.music_volume_now = cur
+            self.music_volume_now = self._music_volume(music_sessions)
 
-            if voice_sess is None:
-                # 语音应用尚未出现(未开麦/未检测到会话) -> 若之前闪避过则恢复
-                if base is not None:
-                    nv = _approach(cur, base, 0.04)
-                    try:
-                        music_sess.volume.SetMasterVolume(nv, None)
-                    except Exception:
-                        pass
-                    if abs(nv - base) < 0.005:
-                        base = None
-                    self.state = "restoring"
-                else:
-                    self.state = "no_voice"
+            if not voice_sessions:
+                # 语音应用尚未出现(未开麦/未检测到会话) -> 直接恢复所有音乐会话
+                for key, ms in _session_keys(music_sessions):
+                    base = self._bases.get(key)
+                    if base is not None:
+                        try:
+                            cur = float(ms.volume.GetMasterVolume())
+                            nv = _approach(cur, base, 0.04)
+                            ms.volume.SetMasterVolume(nv, None)
+                            if abs(nv - base) < 0.005:
+                                self._bases.pop(key, None)
+                        except Exception:
+                            pass
+                self.state = "restoring" if self._bases else "no_voice"
             elif active:
-                if base is None:
-                    base = cur
-                    self.last_base = base
-                target = base * duck_level
-                if cur - target > 0.005:
+                # 语音有输出 -> 压低该应用的全部音乐会话
+                for key, ms in _session_keys(music_sessions):
                     try:
-                        music_sess.volume.SetMasterVolume(_approach(cur, target, 0.04), None)
+                        cur = float(ms.volume.GetMasterVolume())
+                        if key not in self._bases:
+                            self._bases[key] = cur
+                        target = self._bases[key] * duck_level
+                        if cur - target > 0.005:
+                            ms.volume.SetMasterVolume(_approach(cur, target, 0.04), None)
                     except Exception:
                         pass
                 self.state = "ducked"
             else:
-                if base is not None:
-                    if (now - silent_since) >= release_delay:
-                        nv = _approach(cur, base, 0.04)
-                        try:
-                            music_sess.volume.SetMasterVolume(nv, None)
-                        except Exception:
-                            pass
-                        if abs(nv - base) < 0.005:
-                            base = None
-                        self.state = "restoring"
-                    else:
-                        self.state = "ducked"
-                else:
-                    self.state = "normal"
+                # 语音静默: 经过释放延迟后恢复所有音乐会话
+                restoring = False
+                for key, ms in _session_keys(music_sessions):
+                    base = self._bases.get(key)
+                    if base is not None:
+                        if (now - silent_since) >= release_delay:
+                            try:
+                                cur = float(ms.volume.GetMasterVolume())
+                                nv = _approach(cur, base, 0.04)
+                                ms.volume.SetMasterVolume(nv, None)
+                                if abs(nv - base) < 0.005:
+                                    self._bases.pop(key, None)
+                            except Exception:
+                                pass
+                        restoring = True
+                self.state = "restoring" if restoring else "normal"
             time.sleep(0.05)
+
+    @staticmethod
+    def _music_volume(music_sessions):
+        """音乐音量展示值: 取全部会话的最大值 (反映实际听到的响度)。"""
+        vols = []
+        for ms in music_sessions:
+            try:
+                vols.append(float(ms.volume.GetMasterVolume()))
+            except Exception:
+                pass
+        return max(vols) if vols else 1.0
 
     def stop(self, restore=True):
         with self._lock:
             self._running = False
         if restore:
             audio_utils.init_com()
-            base = self.last_base
-            if base is not None:
-                try:
-                    sess = _find_session(audio_utils.get_sessions(), self.music_app)
-                    if sess is not None:
-                        cur = float(sess.volume.GetMasterVolume())
-                        sess.volume.SetMasterVolume(_approach(cur, base, 0.05), None)
-                except Exception:
-                    pass
+            try:
+                sessions = audio_utils.get_sessions()
+                for key, ms in _session_keys(_find_sessions(sessions, self.music_app)):
+                    base = self._bases.get(key)
+                    if base is not None:
+                        try:
+                            ms.volume.SetMasterVolume(base, None)  # 直接恢复原始音量
+                        except Exception:
+                            pass
+            except Exception:
+                pass

@@ -71,11 +71,19 @@ def main():
             root.destroy()
             return 1
 
+        import single_instance
+        mutex_handle, is_first = single_instance.try_acquire()
+        if not is_first:
+            # 已有实例在运行: 通知它显示窗口, 本进程直接退出
+            single_instance.signal_show()
+            return 0
+
         import audio_utils
         audio_utils.init_com()
 
         import gui_app
         app = gui_app.App()
+        app._instance_mutex = mutex_handle   # 保持互斥体句柄, 进程存活期间不释放
         app.mainloop()
         return 0
     except SystemExit:

@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw, ImageTk
 import audio_utils
 import config as cfg_mod
 import engines
+import single_instance
 import updater
 
 # ---------- 配色 (深色图片背景 + 亮色文字, 卡片无填充只留轮廓) ----------
@@ -81,10 +82,17 @@ class GlassLabel(tk.Frame):
         self._justify = justify
         self._anchor = anchor
         self._text_id = None
+        self._last_drawn = None
         self.bind("<Configure>", self._on_resize)
         self._redraw()
 
     def _on_resize(self, _event=None):
+        # 画布尺寸未变则跳过重绘, 减少窗口缩放/拖动时的重复绘制开销
+        try:
+            if (self._canvas.winfo_width(), self._canvas.winfo_height()) == self._last_drawn:
+                return
+        except Exception:
+            pass
         self._redraw()
 
     def _redraw(self):
@@ -100,6 +108,10 @@ class GlassLabel(tk.Frame):
                                       fill=self._fg, anchor="nw", justify=self._justify,
                                       width=self._wraplength or 0, tags=("gl_text",))
         self._resize_to_text()
+        try:
+            self._last_drawn = (c.winfo_width(), c.winfo_height())
+        except Exception:
+            self._last_drawn = None
 
     def _resize_to_text(self):
         """按文字 bbox 调整画布尺寸, 让网格布局为文字分配空间。"""
@@ -168,12 +180,15 @@ class App(ctk.CTk):
         self._last_err = None
         self._save_job = None
         self._resize_job = None
+        self._painted_size = None      # 已绘制背景的窗口尺寸 (拖动窗口时不重绘)
+        self._bg_cache = {}            # (w,h) -> (PIL图, PhotoImage) 背景缓存, 避免重复缩放
         self._bg_img = None           # 背景 PIL 图 (随机挑选)
         self._bg_pil = None           # 合成后的最终背景图
         self._bg_photo = None         # 背景 PhotoImage 引用
         self._bg = None               # 背景画布
         self._bg_ratio = 16 / 9       # 背景图宽高比 (无图时默认 16:9)
         self._ratio_fixed = False     # 启动时是否已按图片比例校正过窗口
+        self._show_event = single_instance.create_show_event()  # 单实例"显示窗口"事件
 
         self.title("音频自动闪避助手")
         self.geometry("1080x608")     # 初始 16:9, 启动后按背景图比例精确调整
@@ -282,7 +297,7 @@ class App(ctk.CTk):
         """加载指定背景图片。"""
         try:
             img = Image.open(path).convert("RGB")
-            img.thumbnail((2048, 2048), Image.LANCZOS)
+            img.thumbnail((1920, 1920), Image.LANCZOS)   # 足够 1080p~2K 窗口, 减小每次缩放开销
             self._bg_img = img
             self._bg_ratio = img.width / img.height
             return True
@@ -367,7 +382,16 @@ class App(ctk.CTk):
             self._fade_frames = None
 
     def _on_bg_resize(self, event):
-        """窗口尺寸变化时 (防抖) 重绘背景。"""
+        """窗口位置/尺寸变化时 (防抖) 重绘背景。
+
+        Windows 上拖动窗口 (仅位置变化) 也会触发 <Configure>; 只要窗口尺寸没变
+        就不重绘, 彻底消除拖拽时的卡顿。尺寸真正变化时才防抖重绘。
+        """
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 2 or h < 2:
+            return
+        if (w, h) == self._painted_size:
+            return   # 位置变了但尺寸没变 (拖动窗口): 无需重绘
         if self._resize_job:
             self.after_cancel(self._resize_job)
         self._resize_job = self.after(200, self._redraw_all)
@@ -376,7 +400,8 @@ class App(ctk.CTk):
         if not self._ratio_fixed:
             self._fix_ratio()
             self._ratio_fixed = True
-        self._draw_background(self.winfo_width(), self.winfo_height())
+        # 缩放时用更快的 BILINEAR (背景照片上几乎看不出与 LANCZOS 的差别)
+        self._draw_background(self.winfo_width(), self.winfo_height(), Image.BILINEAR)
         # 布局稳定后再把背景同步到透明控件
         self.after(80, self._paint_transparent_widgets)
 
@@ -398,34 +423,47 @@ class App(ctk.CTk):
         except Exception:
             pass
 
-    def _draw_background(self, w, h):
-        """绘制背景: 直接缩放填满整窗的图片 (无暗化/暗角/反光等玻璃效果)。"""
+    def _draw_background(self, w, h, resample=Image.LANCZOS):
+        """绘制背景: 直接缩放填满整窗的图片 (无暗化/暗角/反光等玻璃效果)。
+
+        缩放结果与 PhotoImage 按 (w, h) 缓存: 相同尺寸直接复用, 避免反复
+        重采样与 Tk 图像转换 (窗口来回缩放、反复最大化时几乎零开销)。
+        """
         if not self._bg or w < 2 or h < 2:
             return
+        self._painted_size = (w, h)
         c = self._bg
         c.delete("all")
-        if self._bg_img is not None:
-            img = self._bg_img
-            scale = max(w / img.width, h / img.height)   # cover 填满
-            nw = max(1, int(round(img.width * scale)))
-            nh = max(1, int(round(img.height * scale)))
-            try:
-                img = img.resize((nw, nh), Image.LANCZOS)
-            except Exception:
-                pass
-            if nw < w or nh < h:
-                img = img.resize((w, h), Image.LANCZOS)   # 兜底填满
+        hit = self._bg_cache.get((w, h))
+        if hit is not None:
+            img, photo = hit
         else:
-            img = Image.new("RGB", (w, h))
-            d0 = ImageDraw.Draw(img)
-            top, bottom = (36, 26, 38), (26, 20, 32)
-            for y in range(0, h, 2):
-                t = y / max(1, h)
-                d0.rectangle([0, y, w, y + 2], fill=tuple(
-                    int(top[i] + (bottom[i] - top[i]) * t) for i in range(3)))
+            if self._bg_img is not None:
+                img = self._bg_img
+                scale = max(w / img.width, h / img.height)   # cover 填满
+                nw = max(1, int(round(img.width * scale)))
+                nh = max(1, int(round(img.height * scale)))
+                try:
+                    img = img.resize((nw, nh), resample)
+                except Exception:
+                    pass
+                if nw < w or nh < h:
+                    img = img.resize((w, h), resample)   # 兜底填满
+            else:
+                img = Image.new("RGB", (w, h))
+                d0 = ImageDraw.Draw(img)
+                top, bottom = (36, 26, 38), (26, 20, 32)
+                for y in range(0, h, 2):
+                    t = y / max(1, h)
+                    d0.rectangle([0, y, w, y + 2], fill=tuple(
+                        int(top[i] + (bottom[i] - top[i]) * t) for i in range(3)))
+            photo = ImageTk.PhotoImage(img)
+            self._bg_cache[(w, h)] = (img, photo)
+            if len(self._bg_cache) > 3:
+                self._bg_cache.pop(next(iter(self._bg_cache)))   # 淘汰最旧尺寸, 控制内存
         self._bg_pil = img
-        self._bg_photo = ImageTk.PhotoImage(img)
-        c.create_image(w // 2, h // 2, image=self._bg_photo)
+        self._bg_photo = photo
+        c.create_image(w // 2, h // 2, image=photo)
         self._paint_transparent_widgets()
 
     # ================= 透明控件: 背景同步绘制 =================
@@ -1035,6 +1073,10 @@ class App(ctk.CTk):
     # ================= 轮询刷新与日志 =================
 
     def _poll(self):
+        # 单实例: 检测到"再次打开"请求 -> 显示窗口到前台
+        if single_instance.is_show_requested(getattr(self, "_show_event", None)):
+            self.deiconify()
+            self.lift()
         # 处理托盘菜单命令 (托盘线程设置, 主线程安全消费)
         cmd = getattr(self, "_tray_cmd", None)
         if cmd:
