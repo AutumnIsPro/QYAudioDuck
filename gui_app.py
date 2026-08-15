@@ -441,9 +441,11 @@ class App(ctk.CTk):
             return   # 位置变了但尺寸没变 (拖动窗口): 无需重绘
         now = time.monotonic()
         # 两次尺寸变化间隔 < 400ms 且已过启动期 (比例校正/初始布局结束) -> 连续缩放 (拖动边角), 进入幽灵模式
+        # 最大化 (zoomed) 不进入: 单次跳变, 正常重绘即可
         if (not self._ghost and self._last_resize_t is not None
                 and (now - self._last_resize_t) < 0.4
-                and (now - self._start_t) > 2.0):
+                and (now - self._start_t) > 2.0
+                and self.state() != "zoomed"):
             self._enter_ghost()
         self._last_resize_t = now
         delay = 300 if self._ghost else 150
@@ -515,6 +517,10 @@ class App(ctk.CTk):
                         pass
         except Exception:
             pass
+        try:
+            self.update_idletasks()   # 强制几何布局就绪, 避免用刚恢复的过期控件位置绘制背景
+        except Exception:
+            pass
         self._painted_size = None   # 强制重绘 (尺寸可能已变)
         self._redraw_all()
 
@@ -527,6 +533,8 @@ class App(ctk.CTk):
             self._ratio_fixed = True
         # 缩放时用更快的 BILINEAR (背景照片上几乎看不出与 LANCZOS 的差别)
         self._draw_background(self.winfo_width(), self.winfo_height(), Image.BILINEAR)
+        # 布局稳定后再同步一次透明控件的背景 (几何更新可能滞后于重绘, 避免图片错位)
+        self.after(80, self._paint_transparent_widgets)
 
     def _fix_ratio(self):
         """启动时把窗口客户区比例调整为与背景图一致, 使整张图完整显示不裁剪。
