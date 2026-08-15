@@ -345,6 +345,7 @@ class App(ctk.CTk):
             img.thumbnail((1920, 1920), Image.LANCZOS)   # 足够 1080p~2K 窗口, 减小每次缩放开销
             self._bg_img = img
             self._bg_ratio = img.width / img.height
+            self._bg_cache.clear()   # 图片已更换: 旧尺寸缓存里的旧图必须作废, 否则缩放/最大化会回到旧图
             return True
         except Exception:
             self._bg_img = None
@@ -1218,10 +1219,11 @@ class App(ctk.CTk):
     # ================= 轮询刷新与日志 =================
 
     def _poll(self):
-        # 单实例: 检测到"再次打开"请求 -> 显示窗口到前台
+        # 单实例: 检测到"再次打开"请求 -> 显示窗口到前台, 并换一张背景 (每次打开都有变化)
         if single_instance.is_show_requested(getattr(self, "_show_event", None)):
             self.deiconify()
             self.lift()
+            self._change_bg()
         # 处理托盘菜单命令 (托盘线程设置, 主线程安全消费)
         cmd = getattr(self, "_tray_cmd", None)
         if cmd:
@@ -1229,6 +1231,7 @@ class App(ctk.CTk):
             if cmd == "show":
                 self.deiconify()
                 self.lift()
+                self._change_bg()
             elif cmd == "exit":
                 self._real_close()
                 return
