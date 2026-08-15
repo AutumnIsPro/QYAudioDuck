@@ -4,6 +4,7 @@ import os
 import random
 import sys
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 
@@ -67,14 +68,18 @@ def _patch_transparent_redraw():
 _patch_transparent_redraw()
 
 
-class GlassLabel(tk.Frame):
-    """透明文字标签: 文字直接绘制在画布上, 没有任何背景块 (替代 CTkLabel 内嵌的 tk.Label)。"""
+class GlassLabel(tk.Canvas):
+    """透明文字标签: 文字直接绘制在画布上, 没有任何背景块 (替代 CTkLabel 内嵌的 tk.Label)。
+
+    直接继承 tk.Canvas (不再包一层 Frame): 每个标签只占一个 Tk 控件,
+    显著减少窗口缩放/拖动时布局重排与重绘的开销。
+    """
 
     def __init__(self, master=None, text="", font=None, text_color="#ffffff",
                  wraplength=0, justify="left", anchor="w", **kw):
-        super().__init__(master, bg=BG)
-        self._canvas = tk.Canvas(self, highlightthickness=0, bd=0, bg=BG, width=10, height=10)
-        self._canvas.pack(fill="both", expand=True)
+        super().__init__(master, highlightthickness=0, bd=0, bg=BG,
+                         width=10, height=10, **kw)
+        self._canvas = self
         self._text = text
         self._font = font
         self._fg = text_color
@@ -160,6 +165,34 @@ class GlassLabel(tk.Frame):
         return super().cget(key)
 
 
+class GlassFrame(tk.Canvas):
+    """透明布局容器: 轻量画布容器 (替代仅用于布局的透明 CTkFrame)。
+
+    CTkFrame 每次缩放都要重绘圆角矩形并处理自身 Configure, 开销大;
+    纯布局容器改用 tk.Canvas, 每个容器只占一个廉价 Tk 控件, 背景图
+    由 _paint_node 铺上, 面板额外绘制细圆角描边。
+    """
+
+    def __init__(self, master=None, is_panel=False, **kw):
+        kw.pop("fg_color", None)
+        kw.pop("corner_radius", None)
+        kw.pop("border_width", None)
+        kw.pop("border_color", None)
+        super().__init__(master, highlightthickness=0, bd=0, bg=BG, **kw)
+        self._canvas = self
+        self._is_panel = is_panel
+
+    def configure(self, **kw):
+        for ignore in ("fg_color", "corner_radius", "border_width", "border_color"):
+            kw.pop(ignore, None)
+        super().configure(**kw)
+
+    def cget(self, key):
+        if key == "fg_color":
+            return "transparent"
+        return super().cget(key)
+
+
 def _now_tag():
     return datetime.now().strftime("%H:%M:%S")
 
@@ -182,6 +215,10 @@ class App(ctk.CTk):
         self._resize_job = None
         self._painted_size = None      # 已绘制背景的窗口尺寸 (拖动窗口时不重绘)
         self._bg_cache = {}            # (w,h) -> (PIL图, PhotoImage) 背景缓存, 避免重复缩放
+        self._ghost = False            # 缩放幽灵模式: 拖动期间冻结界面
+        self._ghost_photo = None       # 幽灵模式快照
+        self._last_resize_t = None     # 上次尺寸变化时刻 (检测连续缩放)
+        self._start_t = time.monotonic()   # 启动时刻 (启动初期不触发幽灵模式)
         self._bg_img = None           # 背景 PIL 图 (随机挑选)
         self._bg_pil = None           # 合成后的最终背景图
         self._bg_photo = None         # 背景 PhotoImage 引用
@@ -218,8 +255,16 @@ class App(ctk.CTk):
 
     @staticmethod
     def _icon_path():
-        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
-        return p if os.path.exists(p) else None
+        """定位 icon.ico: 打包版优先 exe 旁, 其次 exe 内置 (_MEIPASS), 源码版在脚本旁。"""
+        cands = []
+        if getattr(sys, "frozen", False):
+            cands.append(os.path.join(os.path.dirname(sys.executable), "icon.ico"))
+            cands.append(os.path.join(getattr(sys, "_MEIPASS", ""), "icon.ico"))
+        cands.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico"))
+        for p in cands:
+            if p and os.path.exists(p):
+                return p
+        return None
 
     @staticmethod
     def _set_aumid():
@@ -385,25 +430,103 @@ class App(ctk.CTk):
         """窗口位置/尺寸变化时 (防抖) 重绘背景。
 
         Windows 上拖动窗口 (仅位置变化) 也会触发 <Configure>; 只要窗口尺寸没变
-        就不重绘, 彻底消除拖拽时的卡顿。尺寸真正变化时才防抖重绘。
+        就不重绘, 彻底消除拖拽时的卡顿。连续缩放 (拖动边角) 时进入"幽灵模式":
+        界面冻结为快照、子控件隐藏, 拖动过程只剩背景画布重绘 (~几 ms/事件),
+        松手后恢复控件并重新绘制。
         """
         w, h = self.winfo_width(), self.winfo_height()
         if w < 2 or h < 2:
             return
         if (w, h) == self._painted_size:
             return   # 位置变了但尺寸没变 (拖动窗口): 无需重绘
+        now = time.monotonic()
+        # 两次尺寸变化间隔 < 400ms 且已过启动期 (比例校正/初始布局结束) -> 连续缩放 (拖动边角), 进入幽灵模式
+        if (not self._ghost and self._last_resize_t is not None
+                and (now - self._last_resize_t) < 0.4
+                and (now - self._start_t) > 2.0):
+            self._enter_ghost()
+        self._last_resize_t = now
+        delay = 300 if self._ghost else 150
         if self._resize_job:
             self.after_cancel(self._resize_job)
-        self._resize_job = self.after(200, self._redraw_all)
+        self._resize_job = self.after(delay, self._redraw_all)
+
+    def _enter_ghost(self):
+        """进入缩放幽灵模式: 把当前界面冻结为一张快照, 隐藏所有子控件。
+
+        拖动边角缩放时, 每次鼠标移动都会触发一次全窗口重排 (~150-200ms 卡顿);
+        幽灵模式下子控件被隐藏, 只有背景画布需要重绘, 拖动过程流畅,
+        松手后由 _redraw_all 恢复控件并重新绘制。
+        """
+        if self._ghost:
+            return
+        try:
+            w, h = self.winfo_width(), self.winfo_height()
+            if w < 60 or h < 60:
+                return
+            x, y = self.winfo_rootx(), self.winfo_rooty()
+            from PIL import ImageGrab
+            snap = ImageGrab.grab(bbox=(x, y, x + w, y + h))   # 快照失败则保持普通模式
+        except Exception:
+            return
+        try:
+            for child in self.winfo_children():
+                if child is self._bg:
+                    continue
+                try:
+                    child.grid_remove()
+                except Exception:
+                    try:
+                        child.pack_forget()
+                    except Exception:
+                        pass
+            self._bg.delete("all")
+            self._ghost_photo = ImageTk.PhotoImage(snap)
+            self._bg.create_image(w // 2, h // 2, image=self._ghost_photo)
+            self._ghost = True
+        except Exception:
+            self._ghost = False
+            self._ghost_photo = None
+            for child in self.winfo_children():
+                if child is self._bg:
+                    continue
+                try:
+                    child.grid()
+                except Exception:
+                    pass
+            self._bg.delete("all")
+
+    def _exit_ghost(self):
+        """退出幽灵模式: 恢复子控件, 重新绘制背景。"""
+        if not self._ghost:
+            return
+        self._ghost = False
+        self._ghost_photo = None
+        try:
+            for child in self.winfo_children():
+                if child is self._bg:
+                    continue
+                try:
+                    child.grid()
+                except Exception:
+                    try:
+                        child.pack()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self._painted_size = None   # 强制重绘 (尺寸可能已变)
+        self._redraw_all()
 
     def _redraw_all(self):
+        if self._ghost:
+            self._exit_ghost()   # 缩放结束: 恢复控件并重绘
+            return
         if not self._ratio_fixed:
             self._fix_ratio()
             self._ratio_fixed = True
         # 缩放时用更快的 BILINEAR (背景照片上几乎看不出与 LANCZOS 的差别)
         self._draw_background(self.winfo_width(), self.winfo_height(), Image.BILINEAR)
-        # 布局稳定后再把背景同步到透明控件
-        self.after(80, self._paint_transparent_widgets)
 
     def _fix_ratio(self):
         """启动时把窗口客户区比例调整为与背景图一致, 使整张图完整显示不裁剪。
@@ -511,6 +634,8 @@ class App(ctk.CTk):
         try:
             if isinstance(widget, base_cls):
                 self._paint_widget_bg(widget, rx, ry, wx, wy)
+            elif isinstance(widget, GlassFrame):
+                self._paint_glass_frame(widget, rx, ry, wx, wy)
             elif isinstance(widget, GlassLabel):
                 self._paint_glass_label(widget, rx, ry, wx, wy)
         except Exception:
@@ -614,6 +739,21 @@ class App(ctk.CTk):
         except Exception:
             pass
 
+    def _paint_glass_frame(self, w, rx, ry, wx, wy):
+        """GlassFrame: 铺背景图 (同 GlassLabel), 面板额外画细圆角描边。"""
+        try:
+            c = w._canvas
+            ox = w.winfo_rootx() - rx
+            oy = w.winfo_rooty() - ry
+            c.delete("bgimg")
+            c.create_image(wx - ox, wy - oy, image=self._bg_photo,
+                           anchor="nw", tags=("bgimg",))
+            c.tag_lower("bgimg")
+        except Exception:
+            pass
+        if getattr(w, "_is_panel", False):
+            self._draw_panel_outline(w)
+
     def _draw_panel_outline(self, w):
         """面板细圆角描边: 深色描边 + 浅色粗线 (2px) + 8px 圆角。"""
         try:
@@ -641,10 +781,10 @@ class App(ctk.CTk):
         self.grid_rowconfigure(1, weight=1)
 
         # --- 头部: 标题 + 个性签名 (无头像) ---
-        header = ctk.CTkFrame(self, fg_color="transparent")
+        header = GlassFrame(self)
         header.grid(row=0, column=0, sticky="ew", padx=16, pady=(10, 4))
         header.grid_columnconfigure(0, weight=1)
-        title_row = ctk.CTkFrame(header, fg_color="transparent")
+        title_row = GlassFrame(header)
         title_row.grid(row=0, column=0, sticky="ew")
         GlassLabel(title_row, text="🎧 音频自动闪避助手", font=("Microsoft YaHei UI", 21, "bold"),
                      text_color=ACCENT).pack(side="left")
@@ -659,7 +799,7 @@ class App(ctk.CTk):
                      font=("Microsoft YaHei UI", 12, "bold"), text_color=MUTED).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
         # --- 主体: 两功能卡片 (横向并排) ---
-        body = ctk.CTkFrame(self, fg_color="transparent")
+        body = GlassFrame(self)
         body.grid(row=1, column=0, sticky="nsew", padx=16, pady=6)
         body.grid_columnconfigure(0, weight=1, uniform="cards")
         body.grid_columnconfigure(1, weight=1, uniform="cards")
@@ -669,11 +809,10 @@ class App(ctk.CTk):
         self._build_app_card(body)
 
         # --- 日志 (可开/关, 默认收起) ---
-        log_frame = ctk.CTkFrame(self, fg_color=CARD, corner_radius=8, border_width=0)
-        log_frame._is_panel = True
+        log_frame = GlassFrame(self, is_panel=True)
         log_frame.grid(row=2, column=0, sticky="ew", padx=16, pady=(6, 4))
         log_frame.grid_columnconfigure(0, weight=1)
-        log_head = ctk.CTkFrame(log_frame, fg_color="transparent")
+        log_head = GlassFrame(log_frame)
         log_head.grid(row=0, column=0, sticky="ew", padx=14, pady=(8, 2))
         GlassLabel(log_head, text="📋 运行日志", font=("Microsoft YaHei UI", 13, "bold"),
                      text_color=TEXT).pack(side="left")
@@ -691,13 +830,13 @@ class App(ctk.CTk):
         self.log_box.grid_remove()  # 默认收起日志
 
         # --- 状态栏 ---
-        status = ctk.CTkFrame(self, fg_color="transparent")
+        status = GlassFrame(self)
         status.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 12))
         self.status_label = GlassLabel(status, text="● 未启用任何闪避功能",
                                          font=("Microsoft YaHei UI", 13, "bold"), text_color=MUTED)
         self.status_label.pack(side="left")
         # 关闭方式选择
-        ctrl_bar = ctk.CTkFrame(status, fg_color="transparent")
+        ctrl_bar = GlassFrame(status)
         ctrl_bar.pack(side="right")
         self.update_btn = ctk.CTkButton(ctrl_bar, text="检查更新", width=78, height=26,
                                         font=("Microsoft YaHei UI", 12, "bold"),
@@ -734,7 +873,7 @@ class App(ctk.CTk):
 
     def _slider(self, parent, row, label_text):
         """一行: 左侧标题 + 右侧数值 + 下方滑条。返回 (row, slider, val_label)。"""
-        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        frame = GlassFrame(parent)
         frame.grid(row=row, column=0, sticky="ew", padx=20, pady=(6, 0))
         row += 1
         frame.grid_columnconfigure(0, weight=1)
@@ -748,13 +887,12 @@ class App(ctk.CTk):
         return row, slider, val
 
     def _build_mic_card(self, parent):
-        card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=8, border_width=0)
-        card._is_panel = True
+        card = GlassFrame(parent, is_panel=True)
         card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         card.grid_columnconfigure(0, weight=1)
         row = 0
 
-        head = ctk.CTkFrame(card, fg_color="transparent")
+        head = GlassFrame(card)
         head.grid(row=row, column=0, sticky="ew", padx=20, pady=(16, 2)); row += 1
         GlassLabel(head, text="🎙️ 直播人声突显", font=("Microsoft YaHei UI", 18, "bold"),
                      text_color=ACCENT).pack(side="left")
@@ -768,7 +906,7 @@ class App(ctk.CTk):
                      wraplength=430, justify="left").grid(row=row, column=0, sticky="w", padx=20, pady=(0, 6)); row += 1
 
         # 麦克风设备
-        devrow = ctk.CTkFrame(card, fg_color="transparent")
+        devrow = GlassFrame(card)
         devrow.grid(row=row, column=0, sticky="ew", padx=20, pady=4); row += 1
         GlassLabel(devrow, text="麦克风设备", font=("Microsoft YaHei UI", 13, "bold"),
                      text_color=TEXT).pack(side="left")
@@ -791,7 +929,7 @@ class App(ctk.CTk):
         self.mic_delay_slider.configure(command=self._on_mic_delay)
 
         # 电平表
-        meter = ctk.CTkFrame(card, fg_color="transparent")
+        meter = GlassFrame(card)
         meter.grid(row=row, column=0, sticky="ew", padx=20, pady=(10, 0)); row += 1
         meter.grid_columnconfigure(1, weight=1)
         GlassLabel(meter, text="麦克风电平", font=("Microsoft YaHei UI", 13, "bold"),
@@ -812,13 +950,12 @@ class App(ctk.CTk):
         self.mic_master.grid(row=row, column=0, sticky="w", padx=20, pady=(2, 16)); row += 1
 
     def _build_app_card(self, parent):
-        card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=8, border_width=0)
-        card._is_panel = True
+        card = GlassFrame(parent, is_panel=True)
         card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         card.grid_columnconfigure(0, weight=1)
         row = 0
 
-        head = ctk.CTkFrame(card, fg_color="transparent")
+        head = GlassFrame(card)
         head.grid(row=row, column=0, sticky="ew", padx=20, pady=(16, 2)); row += 1
         GlassLabel(head, text="💬 语音聊天闪避", font=("Microsoft YaHei UI", 18, "bold"),
                      text_color=ACCENT2).pack(side="left")
@@ -845,7 +982,7 @@ class App(ctk.CTk):
         self.app_delay_slider.configure(command=self._on_app_delay)
 
         # 电平表
-        meter = ctk.CTkFrame(card, fg_color="transparent")
+        meter = GlassFrame(card)
         meter.grid(row=row, column=0, sticky="ew", padx=20, pady=(10, 0)); row += 1
         meter.grid_columnconfigure(1, weight=1)
         GlassLabel(meter, text="语音输出电平", font=("Microsoft YaHei UI", 13, "bold"),
@@ -867,7 +1004,7 @@ class App(ctk.CTk):
 
     def _app_row(self, card, row, label_text, key):
         """一行应用选择: 标签 + 下拉框 + 刷新按钮。"""
-        f = ctk.CTkFrame(card, fg_color="transparent")
+        f = GlassFrame(card)
         f.grid(row=row, column=0, sticky="ew", padx=20, pady=4)
         row += 1
         GlassLabel(f, text=label_text, font=("Microsoft YaHei UI", 13, "bold"),

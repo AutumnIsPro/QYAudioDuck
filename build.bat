@@ -9,7 +9,7 @@ if not exist ".venv\Scripts\python.exe" (
 
 echo [BUILD] Packaging single-file exe (dist\AudioDuck.exe)...
 ".venv\Scripts\python.exe" -m pip install -q pyinstaller
-".venv\Scripts\python.exe" -m PyInstaller --noconfirm --onefile --windowed --name AudioDuck --icon icon.ico --collect-all customtkinter --add-data "114514;114514" main.py
+".venv\Scripts\python.exe" -m PyInstaller --noconfirm --onefile --windowed --name AudioDuck --icon icon.ico --collect-all customtkinter --add-data "114514;114514" --add-data "icon.ico;." main.py
 
 echo [DONE] Output: dist\AudioDuck.exe
 pause
